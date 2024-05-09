@@ -1,0 +1,377 @@
+name: $(TeamProject)_$(Build.DefinitionName)_$(SourceBranchName)_$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  - main
+
+parameters:
+  - name: PythonVersion
+    type: string
+    values:
+      - 3.9
+      - 3.10
+      - 3.11
+    default: 3.11
+  - name: TerraformVersion
+    displayName: Terraform Version
+    type: string
+    values:
+      - 1.2.8
+      - 1.2.9
+      - 1.3.0
+      - 1.8.0
+    default: 1.8.0
+
+variables:
+  - name: target.folder
+    value: public
+  - name: System.Debug
+    value: false
+  - name: Terraform.Folder
+    value: "$(Pipeline.Workspace)/iac"
+  - name: Stage.Statefile
+    value: "$(System.TeamProject)_$(Build.DefinitionName)_$(System.StageName)_state.tfstate"
+
+stages:
+  - stage: build
+    displayName: Build and publish code
+    pool:
+      vmImage: windows-latest
+    jobs:
+      - job: shift_left
+        displayName: Run the shift left tests
+        steps:
+          - checkout: self
+          - task: UsePythonVersion@0
+            displayName: "Use Python"
+            enabled: false
+            inputs:
+              versionSpec: ${{ parameters.PythonVersion }}
+          - script: |
+              pip install -r requirements.txt
+              pytest --junitxml=TEST-shiftleft.xml
+            workingDirectory: tests/ci
+            enabled: false
+            displayName: "Run the CI tests"
+          - task: PublishTestResults@2
+            displayName: "Publish Test Results **/TEST-**.xml"
+            enabled: false
+            inputs:
+              searchFolder: tests/ci
+              failTaskOnFailedTests: true
+            condition: always()
+      - job: artifact
+        dependsOn: shift_left
+        displayName: Publish Artifacts
+        steps:
+          - script: |
+              echo TODO create artifact
+          - checkout: self
+            submodules: "true"
+            persistCredentials: true
+          - script: "tree /f /a"
+            displayName: "Show me the files"
+          - task: giuliovdev.hugo-extension.hugo-build-task-v2.HugoTask@2
+            displayName: "Hugo generate "
+            inputs:
+              destination: "$(target.folder)"
+              hugoVersion: 0.92.2
+              extendedVersion: true
+              buildDrafts: true
+          - script: "tree $(target.folder) /f /a"
+            displayName: "Show me the public files"
+          - task: CopyFiles@2
+            displayName: "Copy Files to: $(Build.ArtifactStagingDirectory)"
+            inputs:
+              Contents: "**/$(target.folder)/**"
+              TargetFolder: "$(Build.ArtifactStagingDirectory)"
+          - task: CopyFiles@2
+            displayName: "Copy Files to: $(Build.ArtifactStagingDirectory)"
+            inputs:
+              Contents: "**/iac/**"
+              TargetFolder: "$(Build.ArtifactStagingDirectory)"
+          - task: CopyFiles@2
+            displayName: "Copy Files to: $(Build.ArtifactStagingDirectory)"
+            inputs:
+              Contents: "**/tests/ux/**"
+              TargetFolder: "$(Build.ArtifactStagingDirectory)"  
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish Artifact: drop"
+          - template: templates/steps/azdo_git_tag.yaml
+  - stage: sbx
+    dependsOn: build
+    displayName: Deploy to Sandbox
+    variables:
+      - group: ce06-Azure-Terraform-sbx
+    pool:
+      vmImage: windows-latest
+    jobs:
+      - job: iac
+        displayName: Deploy Infrastructure
+        steps:
+          - checkout: none
+            persistCredentials: true
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              buildType: current
+              artifactName: drop
+              targetPath: $(Pipeline.Workspace)
+          - template: templates/steps/azdo_terraform_access_token.yaml
+            parameters:
+              Folder: $(Terraform.Folder)
+          - task: ms-devlabs.custom-terraform-tasks.custom-terraform-installer-task.TerraformInstaller@0
+            inputs:
+              terraformVersion: ${{ parameters.TerraformVersion }}
+          - task: TerraformTaskV4@4
+            displayName: Terraform init
+            inputs:
+              provider: "azurerm"
+              command: "init"
+              workingDirectory: "$(Terraform.Folder)"
+              backendServiceArm: ce06-Azure-Terraform-sbx
+              backendAzureRmResourceGroupName: $(Tf.ResourceGroup)
+              backendAzureRmStorageAccountName: $(Tf.StorageAccount)
+              backendAzureRmContainerName: $(Tf.StorageContainer)
+              backendAzureRmKey: $(Stage.Statefile)
+          - task: TerraformTaskV4@4
+            displayName: Terraform plan
+            inputs:
+              provider: "azurerm"
+              command: "plan"
+              workingDirectory: "$(Terraform.Folder)"
+              environmentServiceNameAzureRM: ce06-Azure-Terraform-sbx
+              commandOptions: -input=false -var-file=config/common.tfvars -var="environment=$(System.StageName)" -out=plan.tfplan
+          - task: TerraformTaskV4@4
+            displayName: Terraform apply
+            inputs:
+              provider: "azurerm"
+              command: "apply"
+              workingDirectory: "$(Terraform.Folder)"
+              environmentServiceNameAzureRM: ce06-Azure-Terraform-sbx
+              commandOptions: plan.tfplan
+          - task: terraform-outputs@0
+            displayName: Set outputs
+            enabled: true
+            inputs:
+              workingDirectory: $(Terraform.Folder)
+              mapSensitiveOutputsAsSecrets: true
+              variablePrefix: Azure.tf.
+          - script: |
+              echo ##vso[task.setvariable variable=storage_account;isOutput=true]$(Azure.tf.storage_account_name)
+              echo ##vso[task.setvariable variable=storage_account_url;isOutput=true]$(Azure.tf.storage_account_url)
+            name: outputs
+            displayName: Export the terraform outputs for storage account details
+      - job: deploy_sbx
+        displayName: deploy
+        dependsOn: iac
+        variables:
+          storage.account: $[dependencies.iac.outputs['outputs.storage_account']]
+          storage.url: $[dependencies.iac.outputs['outputs.storage_account_url']]
+        steps:
+          - checkout: none
+          - task: CmdLine@2
+            displayName: Show me the environment
+            inputs:
+              script: |
+                echo I am $(System.StageName)
+
+                echo I will deploy $(storage.account)
+
+                echo I will test against $(storage.url)
+
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              buildType: "current"
+              artifactName: "drop"
+              targetPath: "$(Pipeline.Workspace)"
+          - script: "tree /f /a"
+            workingDirectory: "$(Pipeline.Workspace)/public"
+            displayName: List public
+          - task: AzureCLI@2
+            displayName: Azure CLI File Copy
+            inputs:
+              azureSubscription: "ce06-Azure-Terraform-sbx"
+              scriptType: ps
+              scriptLocation: inlineScript
+              inlineScript: |
+                $Container = '$web'
+                
+                az storage copy -s $(Pipeline.Workspace)/public/* --destination-account-name $(storage.account) --destination-container $Container --recursive
+          - task: PowerShell@2
+            inputs:
+              pwsh: true
+              targetType: inline
+              script: |
+                cat C:\Users\VssAdministrator\.azcopy\*.log
+            condition: succeededOrFailed()
+          - task: UsePythonVersion@0
+            displayName: "Use Python ${{ parameters.PythonVersion }}"
+            inputs:
+              versionSpec: "${{ parameters.PythonVersion }}"
+          - script: |
+              pip install -r requirements.txt
+              pytest --url $(storage.url) --headless=yes --junitxml=TEST-selenium.xml
+            workingDirectory: "$(Pipeline.Workspace)/tests/ux"
+            displayName: "Command Line Script"
+          - task: PublishTestResults@2
+            displayName: "Publish Test Results **/TEST-*.xml"
+            inputs:
+              searchFolder: "$(Pipeline.Workspace)/tests/ux"
+              failTaskOnFailedTests: true
+            condition: always()
+  - stage: dev
+    dependsOn: sbx
+    displayName: Deploy to Dev
+    pool:
+      vmImage: windows-latest
+    jobs:
+      - job: deploy_dev
+        displayName: deploy
+        steps:
+          - checkout: none
+          - task: CmdLine@2
+            displayName: Show me the environment
+            inputs:
+              script: |
+                echo I am $(System.StageName)
+
+                echo I will deploy $(storage.account)
+
+                echo I will test against https://$(storage.account).z16.web.core.windows.net/
+
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              buildType: "current"
+              artifactName: "drop"
+              targetPath: "$(Pipeline.Workspace)"
+          - script: "tree /f /a"
+            workingDirectory: "$(Pipeline.Workspace)/public"
+            displayName: List public
+          - task: AzureCLI@2
+            displayName: Azure CLI File Copy
+            inputs:
+              azureSubscription: "ce06-Azure-Terraform-dev"
+              scriptType: ps
+              scriptLocation: inlineScript
+              inlineScript: |
+                $Container = '$web'
+                az storage copy -s $(Pipeline.Workspace)/public/* --destination-account-name $(storage.account) --destination-container $Container --recursive
+          - task: UsePythonVersion@0
+            displayName: "Use Python ${{ parameters.PythonVersion }}"
+            inputs:
+              versionSpec: "${{ parameters.PythonVersion }}"
+          - script: |
+              pip install -r requirements.txt
+              pytest --url https://$(storage.account).z16.web.core.windows.net/ --headless=yes --junitxml=TEST-selenium.xml
+            workingDirectory: "$(Pipeline.Workspace)/tests/ux"
+            displayName: "Command Line Script"
+          - task: PublishTestResults@2
+            displayName: "Publish Test Results **/TEST-*.xml"
+            inputs:
+              searchFolder: "$(Pipeline.Workspace)/tests/ux"
+              failTaskOnFailedTests: true
+            condition: always()
+  - stage: test
+    dependsOn: dev
+    displayName: Deploy to Test
+    pool:
+      vmImage: windows-latest
+    jobs:
+      - job: deploy_test
+        displayName: deploy
+        steps:
+          - checkout: none
+          - task: CmdLine@2
+            displayName: Show me the environment
+            inputs:
+              script: |
+                echo I am $(System.StageName)
+
+                echo I will deploy $(storage.account)
+
+                echo I will test against https://$(storage.account).z16.web.core.windows.net/
+
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              buildType: "current"
+              artifactName: "drop"
+              targetPath: "$(Pipeline.Workspace)"
+          - script: "tree /f /a"
+            workingDirectory: "$(Pipeline.Workspace)/public"
+            displayName: List public
+          - task: AzureCLI@2
+            displayName: Azure CLI File Copy
+            inputs:
+              azureSubscription: "ce06-Azure-Terraform-test"
+              scriptType: ps
+              scriptLocation: inlineScript
+              inlineScript: |
+                $Container = '$web'
+                az storage copy -s $(Pipeline.Workspace)/public/* --destination-account-name $(storage.account) --destination-container $Container --recursive
+          - task: UsePythonVersion@0
+            displayName: "Use Python ${{ parameters.PythonVersion }}"
+            inputs:
+              versionSpec: "${{ parameters.PythonVersion }}"
+          - script: |
+              pip install -r requirements.txt
+              pytest --url https://$(storage.account).z16.web.core.windows.net/ --headless=yes --junitxml=TEST-selenium.xml
+            workingDirectory: "$(Pipeline.Workspace)/tests/ux"
+            displayName: "Command Line Script"
+          - task: PublishTestResults@2
+            displayName: "Publish Test Results **/TEST-*.xml"
+            inputs:
+              searchFolder: "$(Pipeline.Workspace)/tests/ux"
+              failTaskOnFailedTests: true
+            condition: always()
+  - stage: prod
+    dependsOn: test
+    displayName: Deploy to Prod
+    pool:
+      vmImage: windows-latest
+    jobs:
+      - job: deploy_prod
+        displayName: deploy
+        steps:
+          - checkout: none
+          - task: CmdLine@2
+            displayName: Show me the environment
+            inputs:
+              script: |
+                echo I am $(System.StageName)
+
+                echo I will deploy $(storage.account)
+
+                echo I will test against https://$(storage.account).z16.web.core.windows.net/
+
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              buildType: "current"
+              artifactName: "drop"
+              targetPath: "$(Pipeline.Workspace)"
+          - script: "tree /f /a"
+            workingDirectory: "$(Pipeline.Workspace)/public"
+            displayName: List public
+          - task: AzureCLI@2
+            displayName: Azure CLI File Copy
+            inputs:
+              azureSubscription: "ce06-Azure-Terraform-prod"
+              scriptType: ps
+              scriptLocation: inlineScript
+              inlineScript: |
+                $Container = '$web'
+                az storage copy -s $(Pipeline.Workspace)/public/* --destination-account-name $(storage.account) --destination-container $Container --recursive
+
+          - task: UsePythonVersion@0
+            displayName: "Use Python ${{ parameters.PythonVersion }}"
+            inputs:
+              versionSpec: "${{ parameters.PythonVersion }}"
+          - script: |
+              pip install -r requirements.txt
+              pytest --url https://$(storage.account).z16.web.core.windows.net/ --headless=yes --junitxml=TEST-selenium.xml
+            workingDirectory: "$(Pipeline.Workspace)/tests/ux"
+            displayName: "Command Line Script"
+          - task: PublishTestResults@2
+            displayName: "Publish Test Results **/TEST-*.xml"
+            inputs:
+              searchFolder: "$(Pipeline.Workspace)/tests/ux"
+              failTaskOnFailedTests: true
+            condition: always()

@@ -1,0 +1,4 @@
+baseURL = '/'
+languageCode = 'en-us'
+title = 'My Demo00 Site'
+theme = "ananke"
